@@ -1,0 +1,272 @@
+
+   
+    <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Local mDNS - Ultra Low-Latency MQTT Audio</title>
+    
+    <!-- Stable global MQTT browser build wrapper from unpkg -->
+     <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 20px auto; padding: 0 20px; text-align: center; }
+        .step { background: #f4f4f9; padding: 15px; margin-bottom: 15px; border-left: 5px solid #009688; border-radius: 4px; text-align: left; }
+        button { padding: 10px 20px; background: #009688; color: white; border: none; cursor: pointer; font-weight: bold; border-radius: 4px; margin: 5px; }
+        button:hover { background: #00796b; }
+        input[type="text"] { width: 80%; padding: 8px; margin: 10px 0; border: 1px solid #ccc; border-radius: 4px; font-size: 1em; }
+        #status-indicator { font-weight: bold; color: #555; margin: 15px 0; padding: 10px; border: 1px solid #ccc; background: #fff; border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+    <h1>WebRTC Local Real-Time Audio</h1>
+    
+    <div id="status-indicator">Status: Microphones Offline</div>
+    <!-- Clean remote audio destination channel tracking live incoming audio blocks -->
+    <audio id="remoteAudio" autoplay></audio>
+
+    <div class="step">
+        <h3>Step 1: Authorize Microphone</h3>
+        <button id="start-media">Enable Microphone</button>
+    </div>
+
+    <div class="step" id="room-step" style="display:none;">
+        <h3>Step 2: Connect to Room</h3>
+        <p>Enter an identical, unique room name on both devices to link up:</p>
+        <input id="room-id-input" type="text" placeholder="e.g., fast-audio-room-123">
+        <br>
+        <button id="connect-btn">Connect & Initialize</button>
+    </div>
+
+    <script>
+        let pc, localStream, mqttClient;
+        let localIceCandidates = []; 
+        let roomId = "";
+        
+        // Random client key to guarantee loopback safety parameters are preserved
+        const myPeerId = "peer_" + Math.random().toString(36).substring(2, 9);
+
+        // Explicitly stripping STUN/TURN elements to protect and focus strictly on local host mDNS
+        const config = { iceServers: [], iceTransportPolicy: 'all' };
+
+        window.onerror = function(message, source, lineno, colno, error) {
+            alert("JavaScript Error: " + message + " (Line " + lineno + ")");
+            return false;
+        };
+
+        // Step 1: Initialize Ultra Low-Latency Audio Access
+        document.getElementById('start-media').addEventListener('click', async () => {
+            if (typeof mqtt === 'undefined') {
+                return alert("CRITICAL ERROR: MQTT library failed to initialize via CDN. Check network mapping.");
+            }
+            try {
+                document.getElementById('status-indicator').innerText = "Status: Requesting hardware permissions...";
+                
+                // Hardware constraint overrides forcing unbuffered, high-performance audio paths
+                localStream = await navigator.mediaDevices.getUserMedia({ 
+                    video: false, 
+                    audio: {
+                        echoCancellation: false,   // Controls structural echo reflection loops
+                        noiseSuppression: false,   // Drops fan/room white noise parameters
+                        autoGainControl: false,    // Prevents clipping spikes
+						sampleRate: 16000,
+						sampleSize: 16,
+						channelCount: 1,
+                        latency: 0,               // Demands the browser clear internal audio buffer queues
+ 
+                    } 
+                });
+                
+                document.getElementById('status-indicator').innerText = "Status: Microphone Ready. Input matching Room IDs.";
+                document.getElementById('status-indicator').style.color = "#009688";
+                document.getElementById('room-step').style.display = 'block';
+            } catch (err) {
+                console.error(err);
+                alert("HARDWARE BLOCKED: " + err.name + " - " + err.message);
+            }
+        });
+
+        // Step 2: Initialize explicit options block to avoid localhost url resolution mapping bugs
+        document.getElementById('connect-btn').addEventListener('click', () => {
+            roomId = document.getElementById('room-id-input').value.trim();
+            if (!roomId) return alert("Please type a room name first!");
+
+            document.getElementById('status-indicator').innerText = "Status: Connecting to MQTT signaling hub...";
+            document.getElementById('room-step').style.display = 'none';
+
+            const mqttOptions = {
+                host: 'broker.hivemq.com',
+                port: 8884,
+                protocol: 'wss',
+                path: '/mqtt',
+                clientId: 'webrtc_rt_audio_' + Math.random().toString(16).substring(2, 10)
+            };
+
+            mqttClient = mqtt.connect(mqttOptions);
+
+            mqttClient.on('connect', () => {
+                document.getElementById('status-indicator').innerText = `Status: In Room [${roomId}]. Awaiting Peer...`;
+                document.getElementById('status-indicator').style.color = "#009688";
+                
+                mqttClient.subscribe(`webrtc/localmDNS/${roomId}`);
+                createPeerConnection();
+                sendSignalingMessage({ type: "ping" });
+            });
+
+            mqttClient.on('message', async (topic, payload) => {
+                try {
+                    const msg = JSON.parse(payload.toString());
+                    if (msg.sender === myPeerId) return; // Prevent processing loopback frames
+                    await handleSignalingMessage(msg);
+                } catch (e) {
+                    console.error("Malformed MQTT payload skipped", e);
+                }
+            });
+
+            mqttClient.on('error', (err) => {
+                console.error("Broker connection fault:", err);
+                alert("MQTT Broker Connection Drop. Verify network routing metrics.");
+            });
+        });
+
+
+		function hackSdpForRealtime(sdp) {
+		  // 1. Force the audio/video codecs to use lowest packet times (ptime)
+		  // 2. Disable jitter buffer minimum targets if supported by the browser
+		  return sdp
+			//.replace(/a=fmtp:111 /g, "a=fmtp:111 minptime=10;useinbandfec=1;maxaveragebitrate=10000;maxplaybackrate=16000;sprop-maxcapturerate=16000;")
+			.replace(/a=fmtp:111 /g, "a=fmtp:111 minptime=10;useinbandfec=1;maxaveragebitrate=10000;")
+			.replace(/a=mid:/g, "a=x-google-min-bitrate=10000\r\na=mid:"); 
+		}
+
+
+        // FIX: Transceiver priority injector routine
+        function optimizeTransceiverBuffering() {
+            if (!pc) return;
+            const transceivers = pc.getTransceivers();
+            transceivers.forEach(transceiver => {
+                if (transceiver.receiver.track && transceiver.receiver.track.kind === 'audio') {
+                    // Keeps the jitter buffer minimal, forcing immediate playback over sync
+                    transceiver.receiver.playoutDelayHint = 0; 
+                    console.log("Transceiver playout buffer hard-optimized to 0.");
+                }
+            });
+        }
+
+        function createPeerConnection() {
+            pc = new RTCPeerConnection(config);
+
+        const dataChannelOptions = {
+            ordered: false,          // Do not wait for out-of-order/late packets
+            maxRetransmits: 0        // 0 retransmissions means fire-and-forget (ultra low-latency)
+        };
+        const dataChannel = pc.createDataChannel("realtimeDataPipe", dataChannelOptions);
+        setupDataChannelEvents(dataChannel);
+
+            if (localStream) {
+                localStream.getTracks().map(async (track) => { 
+					const sender = pc.addTrack(track, localStream); 
+					const params = sender.getParameters();
+					params.encodings ??= [{}];
+					params.encodings[0].maxBitrate = 64_000;
+					params.encodings[0].priority = "high";
+					params.encodings[0].networkPriority = "high";
+					await sender.setParameters(params);
+				});
+
+            }
+
+            pc.ontrack = (event) => {
+                if (event.streams && event.streams[0]) {
+                    document.getElementById('remoteAudio').srcObject = event.streams[0];
+                    document.getElementById('status-indicator').innerText = "Status: Connected via local mDNS (Real-Time)!";
+                    document.getElementById('status-indicator').style.color = "#00c853";
+
+                    // Kill the browser's native receiving buffer delay queue
+                    //const receiver = event.receiver;
+                    //if (receiver && 'playoutDelayHint' in receiver) {
+                    //    receiver.playoutDelayHint = 0; // Immediate playout strategy matching packet arrival
+                    //}
+					optimizeTransceiverBuffering();
+                }
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate && event.candidate.candidate.includes('typ host')) {
+                    sendSignalingMessage({
+                        type: "candidate",
+                        candidate: event.candidate
+                    });
+                }
+            };
+        }
+
+        function sendSignalingMessage(data) {
+            data.sender = myPeerId;
+            if (mqttClient && mqttClient.connected) {
+                mqttClient.publish(`webrtc/localmDNS/${roomId}`, JSON.stringify(data));
+            }
+        }
+
+        async function handleSignalingMessage(msg) {
+            try {
+                if (msg.type === "ping") {
+                    const offer = await pc.createOffer();
+                    
+                    // Rewrite local session description to enforce small frame packing parameters
+                    offer.sdp = hackSdpForRealtime(offer.sdp);
+					await pc.setLocalDescription(offer);
+					//const optimizedOffer = optimizeSDPForZeroLatency(offer.sdp);
+                    //await pc.setLocalDescription({ type: 'offer', sdp: optimizedOffer });
+                    
+                    sendSignalingMessage({ type: "offer", sdp: pc.localDescription });
+                    document.getElementById('status-indicator').innerText = "Status: Sending real-time connection offer...";
+                } 
+                else if (msg.type === "offer") {
+                    document.getElementById('status-indicator').innerText = "Status: Real-time offer received. Processing Answer...";
+                    await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                    
+                    const answer = await pc.createAnswer();
+                    
+                    // Apply low latency codec parameters to response payload
+                    answer.sdp = hackSdpForRealtime(answer.sdp);
+                    await pc.setLocalDescription(answer);
+                    
+                    sendSignalingMessage({ type: "answer", sdp: pc.localDescription });
+                } 
+                else if (msg.type === "answer") {
+                    document.getElementById('status-indicator').innerText = "Status: Answer accepted. Stabilizing real-time stream...";
+                    await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+                } 
+				else if (msg.type === "candidate") {
+				await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+				}
+				} catch (err) {
+				console.error("WebRTC Error cascade in handler:", err);
+				}
+				}
+				
+				// Helper utility to monitor data channel pipelines
+function setupDataChannelEvents(channel) {
+    channel.onopen = () => {
+        console.log("Unreliable, Unordered Real-Time Data Channel is OPEN!");
+        // Example send test string
+        channel.send("Hello from real-time peer!");
+    };
+
+    channel.onmessage = (event) => {
+        console.log("Received data channel message:", event.data);
+    };
+
+    channel.onerror = (error) => {
+        console.error("Data Channel Error:", error);
+    };
+
+    channel.onclose = () => {
+        console.log("Data Channel Closed.");
+    };
+}
+				
+				</script>
