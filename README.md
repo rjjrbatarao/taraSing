@@ -14,6 +14,7 @@ https://github.com/rakuri255/UltraSinger#audio-full-automatic
 ## Full app
 ```
 https://github.com/thedavidweng/OpenKara
+https://musicdemixer.com/karaoke
 ```
 
 ## Midi
